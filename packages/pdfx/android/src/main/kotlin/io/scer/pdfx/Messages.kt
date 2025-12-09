@@ -15,6 +15,7 @@ import dev.flutter.pigeon.Pigeon
 import io.flutter.BuildConfig
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.view.TextureRegistry
+import io.flutter.view.TextureRegistry.SurfaceProducer.Callback
 import io.scer.pdfx.resources.DocumentRepository
 import io.scer.pdfx.resources.PageRepository
 import io.scer.pdfx.resources.RepositoryItemNotFoundException
@@ -25,13 +26,18 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.lang.RuntimeException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
 class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
                private val documents: DocumentRepository,
                private val pages: PageRepository) : Pigeon.PdfxApi {
 
-    private val textures: SparseArray<TextureRegistry.SurfaceTextureEntry> = SparseArray()
+    private val surfaceProducers: SparseArray<TextureRegistry.SurfaceProducer> = SparseArray()
+    private val documentStatesPerSurface: SparseArray<Pigeon.UpdateTextureMessage> = SparseArray()
 
     override fun openDocumentData(
         message: Pigeon.OpenDataMessage,
@@ -153,43 +159,79 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
         result: Pigeon.Result<Pigeon.RenderPageReply>
     ) {
         val resultResponse = Pigeon.RenderPageReply()
-        try {
-            val pageId = message.pageId!!
-            val width = message.width!!.toInt()
-            val height = message.height!!.toInt()
-            val format = message.format?.toInt() ?: 1 //0 Bitmap.CompressFormat.PNG
-            val forPrint = message.forPrint ?: false;
-            val backgroundColor = message.backgroundColor
-            val color = if (backgroundColor != null) Color.parseColor(backgroundColor) else Color.TRANSPARENT
 
-            val crop = message.crop!!
-            val cropX = if (crop) message.cropX!!.toInt() else 0
-            val cropY = if (crop) message.cropY!!.toInt() else 0
-            val cropH = if (crop) message.cropHeight!!.toInt() else 0
-            val cropW = if (crop) message.cropWidth!!.toInt() else 0
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val pageId = message.pageId ?: run {
+                    result.error(PdfRendererException("pdf_renderer", "Page ID is null", null))
+                    return@launch
+                }
 
-            val quality = message.quality?.toInt() ?: 100
+                val width = message.width?.toInt() ?: run {
+                    result.error(PdfRendererException("pdf_renderer", "Width is null", null))
+                    return@launch
+                }
 
-            val page = pages.get(pageId)
+                val height = message.height?.toInt() ?: run {
+                    result.error(PdfRendererException("pdf_renderer", "Height is null", null))
+                    return@launch
+                }
 
-            val tempOutFileExtension = when (format) {
-                0 -> "jpg"
-                1 -> "png"
-                2 -> "webp"
-                else -> "jpg"
+                val format = message.format?.toInt() ?: 1
+                val backgroundColor = message.backgroundColor
+                val color = backgroundColor?.let { Color.parseColor(it) } ?: Color.TRANSPARENT
+
+                val crop = message.crop ?: false
+                val cropX = if (crop) message.cropX?.toInt() ?: 0 else 0
+                val cropY = if (crop) message.cropY?.toInt() ?: 0 else 0
+                val cropH = if (crop) message.cropHeight?.toInt() ?: 0 else 0
+                val cropW = if (crop) message.width?.toInt() ?: 0 else 0
+
+                val quality = message.quality?.toInt() ?: 100
+                val forPrint = message.forPrint ?: false
+
+                val page = pages.get(pageId)
+
+                val tempOutFileExtension = when (format) {
+                    0 -> "jpg"
+                    1 -> "png"
+                    2 -> "webp"
+                    else -> "jpg"
+                }
+
+                val tempOutFolder = File(binding.applicationContext.cacheDir, "pdf_renderer_cache").apply {
+                    mkdirs()
+                }
+
+                val tempOutFile = File(tempOutFolder, "$randomFilename.$tempOutFileExtension")
+
+                //  background thread render
+                val pageImage = page.render(
+                    file = tempOutFile,
+                    width = width,
+                    height = height,
+                    background = color,
+                    format = format,
+                    crop = crop,
+                    cropX = cropX,
+                    cropY = cropY,
+                    cropW = cropW,
+                    cropH = cropH,
+                    quality = quality,
+                    forPrint = forPrint,
+                )
+
+                withContext(Dispatchers.Main) {
+                    resultResponse.path = pageImage.path
+                    resultResponse.width = pageImage.width.toLong()
+                    resultResponse.height = pageImage.height.toLong()
+                    result.success(resultResponse)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    result.error(PdfRendererException("pdf_renderer", "Unexpected error", e))
+                }
             }
-            val tempOutFolder = File(binding.applicationContext.cacheDir, "pdf_renderer_cache")
-            tempOutFolder.mkdirs()
-            val tempOutFile = File(tempOutFolder, "$randomFilename.$tempOutFileExtension")
-
-            val pageImage = page.render(tempOutFile, width, height, color, format, crop, cropX, cropY, cropW, cropH, quality, forPrint)
-            resultResponse.path = pageImage.path
-            resultResponse.width = pageImage.width.toLong()
-            resultResponse.height = pageImage.height.toLong()
-            result.success(resultResponse)
-
-        } catch (e: Exception) {
-            result.error(PdfRendererException("pdf_renderer", "Unexpected error", e))
         }
     }
 
@@ -207,9 +249,26 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
     }
 
     override fun registerTexture(): Pigeon.RegisterTextureReply {
-        val surfaceTexture = binding.textureRegistry.createSurfaceTexture()
-        val id = surfaceTexture.id().toInt()
-        textures.put(id, surfaceTexture)
+        val surfaceProducer = binding.textureRegistry.createSurfaceProducer()
+        val id = surfaceProducer.id().toInt()
+        surfaceProducers.put(id, surfaceProducer)
+
+        surfaceProducer.setCallback(object : Callback {
+            override fun onSurfaceAvailable() {
+                documentStatesPerSurface[id]?.let { documentUpdate ->
+                    onDocumentOrSurfaceChanged(
+                        surfaceProducer.surface,
+                        documentUpdate,
+                        result = null,
+                    )
+                }
+            }
+
+            override fun onSurfaceCleanup() {
+                // ignore - Surface is used once to draw bitmap
+            }
+        })
+
         val result = Pigeon.RegisterTextureReply()
         result.id = id.toLong()
         return result
@@ -220,11 +279,23 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
         result: Pigeon.Result<Void>
     ) {
         val texId = message.textureId!!.toInt()
+        val surfaceProducer = surfaceProducers[texId]
+        val texWidth = message.textureWidth!!.toInt()
+        val texHeight = message.textureHeight!!.toInt()
+        if (texWidth != 0 && texHeight != 0) {
+            surfaceProducer.setSize(texWidth, texHeight)
+        }
+        documentStatesPerSurface.put(texId, message)
+        onDocumentOrSurfaceChanged(surfaceProducer.surface, message, result)
+    }
+
+    private fun onDocumentOrSurfaceChanged(
+        surface: Surface,
+        message: Pigeon.UpdateTextureMessage,
+        result: Pigeon.Result<Void>?,
+    ) {
         val pageNumber = message.pageNumber!!.toInt()
-        val tex = textures[texId]
         val document = documents.get(message.documentId!!)
-
-
         document.openPage(pageNumber).use { page ->
             val fullWidth = message.fullWidth ?: page.width.toDouble()
             val fullHeight = message.fullHeight ?: page.height.toDouble()
@@ -237,7 +308,7 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
             val backgroundColor = message.backgroundColor
 
             if (width <= 0 || height <= 0) {
-                result.error(PdfRendererException("pdf_renderer", "updateTexture width/height == 0", null))
+                result?.error(PdfRendererException("pdf_renderer", "updateTexture width/height == 0", null))
             }
 
             val mat = Matrix()
@@ -250,13 +321,7 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
                 }
                 page.render(bmp, null, mat, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                val texWidth = message.textureWidth!!.toInt()
-                val texHeight = message.textureHeight!!.toInt()
-                if (texWidth != 0 && texHeight != 0) {
-                    tex.surfaceTexture().setDefaultBufferSize(texWidth, texHeight)
-                }
-
-                Surface(tex.surfaceTexture()).use {
+                surface.use {
                     val canvas = it.lockCanvas(Rect(destX, destY, width, height))
 
                     canvas.drawBitmap(bmp, destX.toFloat(), destY.toFloat(), null)
@@ -264,11 +329,10 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
 
                     it.unlockCanvasAndPost(canvas)
                 }
-                result.success(null)
+                result?.success(null)
             } catch (e: Exception) {
-                result.error(PdfRendererException("pdf_renderer", "updateTexture Unknown error", null))
+                result?.error(PdfRendererException("pdf_renderer", "updateTexture Unknown error", null))
             }
-
         }
     }
 
@@ -279,16 +343,17 @@ class Messages(private val binding : FlutterPlugin.FlutterPluginBinding,
         val texId = message.textureId!!.toInt()
         val width = message.width!!.toInt()
         val height = message.height!!.toInt()
-        val tex = textures[texId]
-        tex?.surfaceTexture()?.setDefaultBufferSize(width, height)
+        val tex = surfaceProducers[texId]
+        tex?.setSize(width, height)
         result.success(null)
     }
 
     override fun unregisterTexture(message: Pigeon.UnregisterTextureMessage) {
         val id = message.id!!.toInt()
-        val tex = textures[id]
-        tex?.release()
-        textures.remove(id)
+        val surfaceProducer = surfaceProducers[id]
+        surfaceProducer?.setCallback(null)
+        surfaceProducer?.release()
+        surfaceProducers.remove(id)
     }
 
     private fun openDataDocument(data: ByteArray): Pair<ParcelFileDescriptor, PdfRenderer> {

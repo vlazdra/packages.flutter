@@ -1,3 +1,21 @@
+## 2.9.2
+
+* Fixed PdfViewPinch when compiling to WASM [pull#586](https://github.com/ScerIO/packages.flutter/pull/586)
+
+## 2.9.1
+
+* Fixed Android [pull#564](https://github.com/ScerIO/packages.flutter/pull/564)
+* Fixed iOS [pull#565](https://github.com/ScerIO/packages.flutter/pull/565)
+
+## 2.9.0
+
+* Implemented document progress feature [pull#537](https://github.com/ScerIO/packages.flutter/pull/537)
+* Migrated to SurfaceProducer in PDFX [pull#543](https://github.com/ScerIO/packages.flutter/pull/543)
+* Updated Messages.kt [pull#541](https://github.com/ScerIO/packages.flutter/pull/541)
+* Removed device_info_plus dependency [pull#544](https://github.com/ScerIO/packages.flutter/pull/544)
+* Updated iOS and macOS projects to remove warnings [pull#562](https://github.com/ScerIO/packages.flutter/pull/562)
+* Updated device_info_plus version [pull#536](https://github.com/ScerIO/packages.flutter/pull/536)
+
 ## 2.8.0
 
 * Added zoom scale customizable [pull#529](https://github.com/ScerIO/packages.flutter/pull/529)
